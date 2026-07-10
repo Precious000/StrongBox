@@ -1,0 +1,73 @@
+
+cluster:
+
+nodes:
+
+- id: node1
+
+host: "0.0.0.0"
+
+port: 8201
+
+- id: node2
+
+host: "0.0.0.0"
+
+port: 8202
+
+- id: node3
+
+host: "0.0.0.0"
+
+port: 8203
+
+election_timeout_ms: 3000
+
+heartbeat_interval_ms: 1000
+
+
+
+shamir:
+
+shares: 5
+
+threshold: 3
+
+
+
+leases:
+
+default_ttl: 3600
+
+max_ttl: 86400
+
+reaper_interval: 30
+
+
+
+dynamic_postgres:
+
+host: "postgres"
+
+port: 5432
+
+database: "postgres"
+
+admin_user: "postgres"
+
+admin_password: "postgrespassword"
+
+
+
+audit:
+
+log_dir: "/data/audit"
+
+hmac_key_file: "/data/audit.key"
+
+
+
+storage:
+
+data_dir: "/data/secrets"
+

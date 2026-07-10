@@ -1,0 +1,24 @@
+# Git
+.git
+
+# Python
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# Runtime data
+data/
+logs/
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
