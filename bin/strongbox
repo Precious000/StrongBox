@@ -38,7 +38,6 @@ lease_reaper &
 
 handle() {
 http_parse
-echo "DEBUGMARKER_M=[$HTTP_METHOD]_P=[$HTTP_PATH]_Q=[$HTTP_QUERY]" >&2
 
 local M="$HTTP_METHOD" P="$HTTP_PATH" B="$HTTP_BODY" T="$HTTP_TOKEN"
 
@@ -335,16 +334,346 @@ fi
 http_respond 404 '{"error":"not found"}'
 }
 
-echo "Listening on port $NODE_PORT"
-REQ_FIFO="/tmp/sb_req_$NODE_PORT"
-RESP_FIFO="/tmp/sb_resp_$NODE_PORT"
-rm -f "$REQ_FIFO" "$RESP_FIFO"
-mkfifo "$REQ_FIFO" "$RESP_FIFO"
 
-while true; do
-  socat TCP-LISTEN:"$NODE_PORT",reuseaddr \
-    SYSTEM:"stdbuf -o0 cat > $REQ_FIFO & stdbuf -o0 cat $RESP_FIFO"
-done &
-while true; do
-  handle < "$REQ_FIFO" > "$RESP_FIFO"
-done
+export STATE_FILE="/tmp/sb_state_${NODE_PORT}"
+cat > "$STATE_FILE" << STATEEOF
+IS_SEALED=true
+STRONGBOX_KEK=
+UNSEAL_PROGRESS=0
+UNSEAL_SHARES_JSON=[]
+INITIALIZED=$([ -f "$INIT_FILE" ] && echo true || echo false)
+STATEEOF
+chmod 600 "$STATE_FILE"
+
+echo "StrongBox $NODE_ID listening on port $NODE_PORT"
+
+_handle_request() {
+    source "$STATE_FILE" 2>/dev/null || true
+    source /app/lib/storage.sh
+    source /app/lib/crypto.sh
+    source /app/lib/auth.sh
+    source /app/lib/lease.sh
+    source /app/lib/dynamic.sh
+    source /app/lib/consensus.sh
+    source /app/lib/audit.sh
+    source /app/lib/http.sh
+
+    http_parse
+
+    local M="$HTTP_METHOD" P="$HTTP_PATH" B="$HTTP_BODY" T="$HTTP_TOKEN"
+
+    if [[ "$IS_SEALED" == "true" ]]; then
+        if [[ "$P" != "/v1/sys/health" ]] && \
+           [[ "$P" != "/v1/sys/unseal" ]] && \
+           [[ "$P" != "/v1/sys/init" ]]; then
+            http_respond 503 '{"error":"vault is sealed"}'
+            return
+        fi
+    fi
+
+    if [[ "$M" == "GET" && "$P" == "/v1/sys/health" ]]; then
+        local leader
+        leader=$(consensus_get_leader)
+        local sealed
+        [[ "$IS_SEALED" == "true" ]] && sealed="true" || sealed="false"
+        http_respond 200 "{\"sealed\":$sealed,\"leader\":\"$leader\",\"term\":$CURRENT_TERM,\"node_id\":\"$NODE_ID\"}"
+        return
+    fi
+
+    if [[ "$M" == "POST" && "$P" == "/v1/sys/init" ]]; then
+        if [[ "$INITIALIZED" == "true" ]] || [[ -f "$INIT_FILE" ]]; then
+            http_respond 400 '{"error":"already initialized"}'
+            return
+        fi
+        local master_key shares_json shares_output root_result root_token
+        master_key=$(openssl rand -hex 32)
+        shares_json=$(python3 /app/lib/shamir.py split "$master_key" "$UNSEAL_TOTAL" "$UNSEAL_THRESHOLD")
+        shares_output=$(echo "$shares_json" | python3 -c "
+import sys,json
+shares=json.load(sys.stdin)
+print(json.dumps([str(s['x'])+':'+s['y'] for s in shares]))
+")
+        auth_create_policy "root" '{"rules":[{"path":"*","capabilities":["read","write","delete"]}]}'
+        root_result=$(auth_create_token "root" 876000)
+        root_token=$(echo "$root_result" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+        master_key=""
+        touch "$INIT_FILE"
+        sed -i "s|^INITIALIZED=.*|INITIALIZED=true|" "$STATE_FILE"
+        audit_append "init" "/" "system"
+        http_respond 200 "{\"shares\":$shares_output,\"root_token\":\"$root_token\"}"
+        return
+    fi
+
+    if [[ "$M" == "POST" && "$P" == "/v1/sys/unseal" ]]; then
+        local share
+        share=$(http_json "$B" "share")
+        local current_shares progress
+        current_shares=$(grep "^UNSEAL_SHARES_JSON=" "$STATE_FILE" | cut -d= -f2-)
+        progress=$(grep "^UNSEAL_PROGRESS=" "$STATE_FILE" | cut -d= -f2-)
+        local new_shares new_progress
+        new_shares=$(python3 -c "
+import json
+shares=json.loads('''$current_shares''')
+shares.append('$share')
+print(json.dumps(shares))
+")
+        new_progress=$((progress + 1))
+        sed -i "s|^UNSEAL_SHARES_JSON=.*|UNSEAL_SHARES_JSON=${new_shares}|" "$STATE_FILE"
+        sed -i "s|^UNSEAL_PROGRESS=.*|UNSEAL_PROGRESS=${new_progress}|" "$STATE_FILE"
+
+        if [[ $new_progress -ge $UNSEAL_THRESHOLD ]]; then
+            local shares_arg master_key
+            shares_arg=$(python3 -c "
+import json
+shares=json.loads('''$new_shares''')
+result=[]
+for s in shares[:$UNSEAL_THRESHOLD]:
+    x,y=s.split(':',1)
+    result.append({'x':int(x),'y':y})
+print(json.dumps(result))
+")
+            master_key=$(python3 /app/lib/shamir.py reconstruct "$shares_arg" 32)
+            sed -i "s|^STRONGBOX_KEK=.*|STRONGBOX_KEK=${master_key}|" "$STATE_FILE"
+            sed -i "s|^IS_SEALED=.*|IS_SEALED=false|" "$STATE_FILE"
+            sed -i "s|^UNSEAL_SHARES_JSON=.*|UNSEAL_SHARES_JSON=[]|" "$STATE_FILE"
+            sed -i "s|^UNSEAL_PROGRESS=.*|UNSEAL_PROGRESS=0|" "$STATE_FILE"
+            master_key=""
+            audit_append "unseal" "/" "operator"
+            http_respond 200 "{\"sealed\":false,\"progress\":\"${UNSEAL_THRESHOLD}/${UNSEAL_THRESHOLD}\"}"
+        else
+            http_respond 200 "{\"sealed\":true,\"progress\":\"${new_progress}/${UNSEAL_THRESHOLD}\"}"
+        fi
+        return
+    fi
+
+    if [[ "$M" == "POST" && "$P" == "/v1/sys/seal" ]]; then
+        local meta
+        meta=$(auth_validate_token "$T" 2>/dev/null) || {
+            http_respond 401 '{"error":"unauthorized"}'
+            return
+        }
+        sed -i "s|^IS_SEALED=.*|IS_SEALED=true|" "$STATE_FILE"
+        sed -i "s|^STRONGBOX_KEK=.*|STRONGBOX_KEK=|" "$STATE_FILE"
+        audit_append "seal" "/" "$T"
+        http_respond 204 ""
+        return
+    fi
+
+    local meta token_id
+    meta=$(auth_validate_token "$T" 2>/dev/null) || {
+        http_respond 401 '{"error":"unauthorized"}'
+        return
+    }
+    token_id=$(echo "$meta" | python3 -c "import sys,json; print(json.load(sys.stdin)['token_id'])")
+
+    if [[ "$M" == "POST" && "$P" == "/v1/auth/login" ]]; then
+        local user pass result
+        user=$(http_json "$B" "username")
+        pass=$(http_json "$B" "password")
+        result=$(auth_login "$user" "$pass") && {
+            audit_append "login" "/" "$user"
+            http_respond 200 "$result"
+        } || http_respond 401 '{"error":"invalid credentials"}'
+        return
+    fi
+
+    if [[ "$M" == "POST" && "$P" == "/v1/auth/revoke" ]]; then
+        local rt
+        rt=$(http_json "$B" "token")
+        auth_revoke_token "$rt" && {
+            audit_append "revoke" "/" "$token_id"
+            http_respond 204 ""
+        } || http_respond 404 '{"error":"token not found"}'
+        return
+    fi
+
+    if [[ "$M" == "GET" && "$P" == "/v1/auth/self" ]]; then
+        http_respond 200 "$meta"
+        return
+    fi
+
+    if [[ "$M" == "PUT" && "$P" =~ ^/v1/policies/(.+)$ ]]; then
+        local pname="${BASH_REMATCH[1]}"
+        auth_check_policy "$token_id" "write" "policies/$pname" || {
+            http_respond 403 '{"error":"forbidden"}'
+            return
+        }
+        auth_create_policy "$pname" "$B"
+        audit_append "policy_write" "policies/$pname" "$token_id"
+        http_respond 201 '{"status":"created"}'
+        return
+    fi
+
+    if [[ "$M" == "GET" && "$P" =~ ^/v1/policies/(.+)$ ]]; then
+        local pname="${BASH_REMATCH[1]}"
+        local pd
+        pd=$(auth_get_policy "$pname") && http_respond 200 "$pd" || \
+            http_respond 404 '{"error":"not found"}'
+        return
+    fi
+
+    if [[ "$M" == "PUT" && "$P" =~ ^/v1/secrets/(.+)$ ]]; then
+        local spath="${BASH_REMATCH[1]}"
+        auth_check_policy "$token_id" "write" "secret/$spath" || {
+            http_respond 403 '{"error":"forbidden"}'
+            return
+        }
+        local enc version
+        enc=$(crypto_encrypt_secret "$B") || {
+            http_respond 503 '{"error":"encryption failed"}'
+            return
+        }
+        version=$(storage_put_version "secret/$spath" "$enc")
+        audit_append "secret_write" "secret/$spath" "$token_id"
+        http_respond 201 "{\"version\":$version}"
+        return
+    fi
+
+    if [[ "$M" == "GET" && "$P" =~ ^/v1/secrets/(.+)$ ]]; then
+        local spath="${BASH_REMATCH[1]}"
+        local ver=""
+        [[ "$HTTP_QUERY" =~ version=([0-9]+) ]] && ver="${BASH_REMATCH[1]}"
+        auth_check_policy "$token_id" "read" "secret/$spath" || {
+            http_respond 403 '{"error":"forbidden"}'
+            return
+        }
+        local enc
+        enc=$(storage_get_version "secret/$spath" "$ver") || {
+            http_respond 404 '{"error":"not found"}'
+            return
+        }
+        local ct n wd dn plain latest lease
+        ct=$(echo "$enc" | python3 -c "import sys,json; print(json.load(sys.stdin)['ciphertext'])")
+        n=$(echo "$enc" | python3 -c "import sys,json; print(json.load(sys.stdin)['nonce'])")
+        wd=$(echo "$enc" | python3 -c "import sys,json; print(json.load(sys.stdin)['wrapped_dek'])")
+        dn=$(echo "$enc" | python3 -c "import sys,json; print(json.load(sys.stdin)['dek_nonce'])")
+        plain=$(crypto_decrypt_secret "$ct" "$n" "$wd" "$dn") || {
+            http_respond 503 '{"error":"decryption failed"}'
+            return
+        }
+        latest=$(storage_latest_version "secret/$spath")
+        lease=$(lease_create "secret/$spath" "$token_id")
+        audit_append "secret_read" "secret/$spath" "$token_id"
+        http_respond 200 "{\"data\":$plain,\"version\":$latest,\"lease\":$lease}"
+        return
+    fi
+
+    if [[ "$M" == "DELETE" && "$P" =~ ^/v1/secrets/(.+)$ ]]; then
+        local spath="${BASH_REMATCH[1]}"
+        auth_check_policy "$token_id" "delete" "secret/$spath" || {
+            http_respond 403 '{"error":"forbidden"}'
+            return
+        }
+        storage_delete "secret/$spath"
+        audit_append "secret_delete" "secret/$spath" "$token_id"
+        http_respond 204 ""
+        return
+    fi
+
+    if [[ "$M" == "GET" && "$P" =~ ^/v1/dynamic-postgres/(.+)$ ]]; then
+        local rprefix="${BASH_REMATCH[1]}"
+        auth_check_policy "$token_id" "read" "dynamic-postgres/$rprefix" || {
+            http_respond 403 '{"error":"forbidden"}'
+            return
+        }
+        local creds
+        creds=$(dynamic_mint_postgres_role "$rprefix") || {
+            http_respond 503 '{"error":"database unreachable"}'
+            return
+        }
+        local lease lid uname pw
+        lease=$(lease_create "dynamic-postgres/$rprefix" "$token_id" 3600)
+        lid=$(echo "$lease" | python3 -c "import sys,json; print(json.load(sys.stdin)['lease_id'])")
+        uname=$(echo "$creds" | python3 -c "import sys,json; print(json.load(sys.stdin)['username'])")
+        pw=$(echo "$creds" | python3 -c "import sys,json; print(json.load(sys.stdin)['password'])")
+        python3 -c "
+import json
+lf='/data/leases/${lid}.json'
+with open(lf) as f: d=json.load(f)
+d['pg_role']='$uname'
+with open(lf,'w') as f: json.dump(d,f)
+"
+        audit_append "dynamic_read" "dynamic-postgres/$rprefix" "$token_id"
+        http_respond 200 "{\"username\":\"$uname\",\"password\":\"$pw\",\"lease\":$lease}"
+        return
+    fi
+
+    if [[ "$M" == "POST" && "$P" =~ ^/v1/leases/([^/]+)/renew$ ]]; then
+        local lid="${BASH_REMATCH[1]}"
+        local result
+        result=$(lease_renew "$lid") && \
+            http_respond 200 "{\"new_expires_at\":\"$result\"}" || \
+            http_respond 400 '{"error":"cannot renew"}'
+        return
+    fi
+
+    if [[ "$M" == "POST" && "$P" =~ ^/v1/leases/([^/]+)/revoke$ ]]; then
+        local lid="${BASH_REMATCH[1]}"
+        lease_revoke "$lid"
+        http_respond 204 ""
+        return
+    fi
+
+    if [[ "$M" == "GET" && "$P" == "/v1/audit" ]]; then
+        local qt=""
+        [[ "$HTTP_QUERY" =~ token=([^&]+) ]] && qt="${BASH_REMATCH[1]}"
+        http_respond 200 "$(audit_query "$qt")"
+        return
+    fi
+
+    if [[ "$M" == "POST" && "$P" == "/internal/vote" ]]; then
+        local term cid
+        term=$(http_json "$B" "term")
+        cid=$(http_json "$B" "candidate_id")
+        http_respond 200 "$(consensus_handle_vote "$term" "$cid")"
+        return
+    fi
+
+    if [[ "$M" == "POST" && "$P" == "/internal/heartbeat" ]]; then
+        local term lid
+        term=$(http_json "$B" "term")
+        lid=$(http_json "$B" "leader_id")
+        http_respond 200 "$(consensus_handle_heartbeat "$term" "$lid")"
+        return
+    fi
+
+    http_respond 404 '{"error":"not found"}'
+}
+
+export STATE_FILE
+export -f _handle_request
+export -f http_parse http_respond http_json
+export -f storage_init storage_get storage_put storage_delete
+export -f storage_list storage_put_version storage_get_version
+export -f storage_latest_version _safe_path
+export -f crypto_set_kek crypto_clear_kek crypto_is_unsealed
+export -f crypto_generate_key crypto_generate_nonce
+export -f crypto_aes_gcm_encrypt crypto_aes_gcm_decrypt
+export -f crypto_wrap_dek crypto_unwrap_dek
+export -f crypto_encrypt_secret crypto_decrypt_secret
+export -f crypto_hmac_sha256 crypto_hash_password
+export -f auth_init auth_generate_token auth_create_token
+export -f auth_validate_token auth_revoke_token
+export -f auth_check_policy auth_create_policy auth_get_policy
+export -f auth_create_user auth_login
+export -f lease_init lease_create lease_get lease_renew
+export -f lease_revoke lease_reaper _lease_revoke_pg_role
+export -f dynamic_mint_postgres_role dynamic_revoke_role _pg
+export -f consensus_init consensus_start_election
+export -f _consensus_become_leader _consensus_heartbeat_loop
+export -f _consensus_peers _consensus_majority _consensus_persist
+export -f consensus_handle_vote consensus_handle_heartbeat
+export -f consensus_election_watcher consensus_is_leader
+export -f consensus_get_leader
+export -f audit_init audit_append audit_query
+export -f _audit_prev_hash _audit_next_index
+
+export NODE_ID NODE_PORT STORAGE_DIR TOKEN_DIR POLICY_DIR
+export USER_DIR LEASE_DIR CONSENSUS_DIR AUDIT_LOG AUDIT_KEY_FILE
+export AUDIT_HMAC_KEY CURRENT_TERM VOTED_FOR CURRENT_ROLE
+export CURRENT_LEADER LAST_HEARTBEAT DEFAULT_TTL MAX_TTL
+export REAPER_INTERVAL PG_HOST PG_PORT PG_DB PG_ADMIN PG_PASS
+export INIT_FILE UNSEAL_THRESHOLD UNSEAL_TOTAL
+
+socat TCP-LISTEN:${NODE_PORT},reuseaddr,fork \
+    EXEC:"/bin/bash -c _handle_request",nofork
