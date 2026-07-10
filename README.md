@@ -34,7 +34,6 @@ StrongBox is a lightweight, Vault-inspired secret management system built with B
 * Nginx
 * OpenSSL
 * Python (Shamir Secret Sharing)
-* Netcat
 * JSON
 * Linux
 
